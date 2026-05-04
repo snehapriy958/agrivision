@@ -70,15 +70,18 @@ def main() -> None:
         st.divider()
 
         if st.button("🔍 Predict", use_container_width=True):
-            with st.spinner("Analysing image…"):
+            with st.spinner("Analysing image… (first run may take ~30–60 seconds)"):
                 try:
                     predictions = call_api(uploaded_file)
                     if not predictions:
-                        st.error("No predictions returned from API")
+                        st.error("No predictions returned. Try another image.")
                         return
 
                 except Exception as exc:
-                    st.error(f"Unexpected error: {exc}")
+                    st.error(f"Inference failed. Please try again.")
+
+                    st.exception(exc)
+                    
                     return
 
             st.subheader("Top Predictions")

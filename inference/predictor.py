@@ -6,8 +6,7 @@ Usage        : from inference.predictor import predict
 """
 
 import os
-
-import urllib.request
+import streamlit as st
 
 import torch
 import torch.nn.functional as F
@@ -38,36 +37,33 @@ MODEL, CLASS_NAMES = None, None
 # Model
 # ---------------------------------------------------------------------------
 
+@st.cache_resource
 def load_model(cfg: dict = CONFIG):
     global MODEL, CLASS_NAMES
 
     if MODEL is None:
         import gdown
 
-        # Absolute path (robust for Streamlit Cloud)
         BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         MODEL_PATH = os.path.join(BASE_DIR, cfg["checkpoint_path"])
 
-        # Google Drive file ID (NOT full link)
         MODEL_URL = "https://drive.google.com/uc?id=1OJ_0ckqRI4xGp-MpYa3FgjhEntL_pHe4"
 
-        # Download if not exists
+        # Download model if not present
         if not os.path.exists(MODEL_PATH):
             os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
             print("Downloading model...")
-            gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+            gdown.download(MODEL_URL, MODEL_PATH, quiet=False, fuzzy=True)
 
-        # Load model (PyTorch 2.6 fix)
+        # Load model
         checkpoint = torch.load(
             MODEL_PATH,
             map_location="cpu",
             weights_only=False
         )
 
-        # Initialize model
         MODEL = CNNModel(num_classes=cfg["num_classes"])
 
-        # Flexible loading
         if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
             MODEL.load_state_dict(checkpoint["state_dict"])
         else:
@@ -75,7 +71,6 @@ def load_model(cfg: dict = CONFIG):
 
         MODEL.eval()
 
-        # Load class names once
         if CLASS_NAMES is None:
             CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
 
