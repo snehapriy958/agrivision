@@ -4,12 +4,18 @@ Run : streamlit run frontend/app.py
 """
 
 import os
-import tempfile
-import logging
+import sys
+
+# 🔥 FORCE absolute project root
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 import streamlit as st
 from inference.predictor import predict
-
+import tempfile
+import logging
 
 # ---------------------------------------------------------------------------
 # Config
@@ -131,9 +137,18 @@ def main() -> None:
             f"({top['confidence']*100:.2f}%)"
         )
 
-        # Low confidence warning
-        if top["confidence"] < 0.6:
-            st.warning("⚠️ Low confidence prediction. Please verify manually.")
+        # 🔥 Unknown detection logic
+
+        if top["confidence"] < 0.5:
+            st.error("❌ Unsupported or unclear image. Please upload a valid crop leaf.")
+        if top["confidence"] < 0.7:
+            st.warning(
+                "⚠️ Low confidence prediction.\n\n"
+                "This image may not belong to supported crops (Tomato, Potato, Corn). "
+                "Please verify manually." 
+            )
+
+        
 
         # Top-K display
         for rank, pred in enumerate(predictions, start=1):
