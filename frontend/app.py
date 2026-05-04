@@ -3,15 +3,26 @@ frontend/app.py — AgriVision Streamlit Frontend
 Run : streamlit run frontend/app.py
 """
 
-
-import sys
 import os
-sys.path.append(os.path.abspath("."))
+import tempfile
+import logging
 
 import streamlit as st
 from inference.predictor import predict
-import tempfile
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+MODEL_VERSION = "v1"   # 🔁 change when model updates
+
+
+# ---------------------------------------------------------------------------
+# Logging (minimal)
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -36,19 +47,30 @@ def get_advice(label: str) -> str | None:
         return "Plant is healthy. Maintain current care."
     return None
 
+
 def format_label(label: str) -> str:
     return label.replace('_', ' ').title()
 
 
+# ---------------------------------------------------------------------------
+# Cached Prediction
+# ---------------------------------------------------------------------------
 
-def call_api(image_file):
-        
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        image_file.seek(0)
-        tmp.write(image_file.read())
-        tmp_path = tmp.name
+@st.cache_data(show_spinner=False)
+def cached_predict(image_bytes: bytes, model_version: str):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    try:
+        tmp.write(image_bytes)
+        tmp.flush()
+        tmp.close()  # important for Windows
 
-    return predict(tmp_path)
+        return predict(tmp.name)
+
+    finally:
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -58,57 +80,90 @@ def call_api(image_file):
 def main() -> None:
     st.set_page_config(page_title="AgriVision", page_icon="🌿", layout="centered")
 
+    # Header
     st.title("🌿 AgriVision — Crop Disease Detection")
+    st.caption("⚡ First prediction may take ~30–60 seconds (model will download once)")
     st.caption("Upload a crop image to detect potential diseases and receive care advice.")
 
+    # Upload
     uploaded_file = st.file_uploader(
-        "Choose an image", type=["jpg", "jpeg", "png"], label_visibility="collapsed"
+        "Upload a crop leaf image",
+        type=["jpg", "jpeg", "png"],
+        help="Use a clear leaf image (max ~5MB). Center the leaf and avoid blur."
     )
 
+    # File size guard
+    if uploaded_file and uploaded_file.size > 5 * 1024 * 1024:
+        st.error("File too large (>5MB). Please upload a smaller image.")
+        return
+
     if uploaded_file:
-        st.image(uploaded_file, caption="Uploaded Image", width=300)
-        st.divider()
+        st.info("📸 Tip: Use a clear, close-up image of a single leaf for best accuracy.")
 
-        if st.button("🔍 Predict", use_container_width=True):
-            with st.spinner("Analysing image… (first run may take ~30–60 seconds)"):
-                try:
-                    predictions = call_api(uploaded_file)
-                    if not predictions:
-                        st.error("No predictions returned. Try another image.")
-                        return
+        # Preview
+        st.image(uploaded_file, caption="Uploaded Image", width=320)
+        st.write("")
 
-                except Exception as exc:
-                    st.error(f"Inference failed. Please try again.")
+        # Convert once
+        image_bytes = uploaded_file.getvalue()
 
-                    st.exception(exc)
-                    
+        # Predict
+        with st.spinner("Analysing image… (first run may take ~30–60 seconds)"):
+            try:
+                predictions = cached_predict(image_bytes, MODEL_VERSION)
+
+                if not predictions:
+                    st.error("No predictions returned. Try another image.")
                     return
 
-            st.subheader("Top Predictions")
-            top = predictions[0]
-            st.success(
-                f"Most likely: **{format_label(top['label'])}** "
-                f"({top['confidence']*100:.2f}%)"
-            )
+            except Exception as exc:
+                logging.error(str(exc))
+                st.error("⚠️ Inference failed. Please try another image or refresh.")
+                return
 
-            for rank, pred in enumerate(predictions, start=1):
-                label      = pred["label"]
-                confidence = pred["confidence"]
-                status     = get_confidence_status(confidence)
-                pct = f"{max(confidence * 100, 0.01):.2f}%"
-                
-                with st.container(border=True):
-                    col_rank, col_label, col_conf, col_status = st.columns([0.5, 3, 1.5, 2.5])
-                    col_rank.markdown(f"**#{rank}**")
-                    col_label.markdown(f"**{format_label(label)}**")
-                    col_conf.markdown(f"`{pct}`")
-                    col_status.markdown(status)
-                    st.progress(min(int(confidence * 100), 100))
+        # Results
+        st.write("")
+        st.subheader("Top Predictions")
 
-                advice = get_advice(label)
-                if rank == 1 and advice:
-                    st.info(f"💡 Recommendation: {advice}")
+        top = predictions[0]
+        st.success(
+            f"Most likely: **{format_label(top['label'])}** "
+            f"({top['confidence']*100:.2f}%)"
+        )
 
+        # Low confidence warning
+        if top["confidence"] < 0.6:
+            st.warning("⚠️ Low confidence prediction. Please verify manually.")
+
+        # Top-K display
+        for rank, pred in enumerate(predictions, start=1):
+            label = pred["label"]
+            confidence = pred["confidence"]
+            status = get_confidence_status(confidence)
+            pct = f"{confidence * 100:.2f}%"
+
+            with st.container(border=True):
+                col_rank, col_label, col_conf, col_status = st.columns([0.5, 3, 1.5, 2.5])
+                col_rank.markdown(f"**#{rank}**")
+                col_label.markdown(f"**{format_label(label)}**")
+                col_conf.markdown(f"`{pct}`")
+                col_status.markdown(status)
+
+                st.progress(max(1, min(int(confidence * 100), 100)))
+
+            # Recommendation
+            advice = get_advice(label)
+            if rank == 1 and advice:
+                st.info(f"💡 Recommendation: {advice}")
+
+    # Footer
+    st.divider()
+    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9 • Output: Top-3 predictions")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()
