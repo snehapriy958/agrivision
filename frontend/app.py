@@ -3,11 +3,15 @@ frontend/app.py — AgriVision Streamlit Frontend
 Run : streamlit run frontend/app.py
 """
 
-import requests
+
+import sys
+import os
+sys.path.append(os.path.abspath("."))
+
 import streamlit as st
+from inference.predictor import predict
+import tempfile
 
-
-API_URL = "http://127.0.0.1:8000/predict"
 
 
 # ---------------------------------------------------------------------------
@@ -36,15 +40,15 @@ def format_label(label: str) -> str:
     return label.replace('_', ' ').title()
 
 
-def call_api(image_file) -> list[dict]:
-    image_file.seek(0)
-    response = requests.post(
-        API_URL,
-        files={"file": (image_file.name, image_file, image_file.type)},
-        timeout=15,
-    )
-    response.raise_for_status()
-    return response.json()["predictions"]
+
+def call_api(image_file):
+        
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        image_file.seek(0)
+        tmp.write(image_file.read())
+        tmp_path = tmp.name
+
+    return predict(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -73,12 +77,6 @@ def main() -> None:
                         st.error("No predictions returned from API")
                         return
 
-                except requests.exceptions.ConnectionError:
-                    st.error("Cannot reach the API. Make sure the backend is running on http://127.0.0.1:8000")
-                    return
-                except requests.exceptions.HTTPError as exc:
-                    st.error(f"API returned an error: {exc.response.status_code} — {exc.response.text}")
-                    return
                 except Exception as exc:
                     st.error(f"Unexpected error: {exc}")
                     return

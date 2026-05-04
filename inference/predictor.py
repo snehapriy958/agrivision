@@ -5,6 +5,9 @@ Usage        : from inference.predictor import predict
                results = predict("path/to/image.jpg")
 """
 
+import os
+
+import urllib.request
 
 import torch
 import torch.nn.functional as F
@@ -20,7 +23,7 @@ from inference.preprocess import PlantDataset
 # ---------------------------------------------------------------------------
 
 CONFIG = {
-    "checkpoint_path" : "best_model.pth",
+    "checkpoint_path" : "models/best_model.pth",
     "data_root"       : "data/raw",
     "num_classes"     : 9,
     "top_k"           : 3,
@@ -39,15 +42,44 @@ def load_model(cfg: dict = CONFIG):
     global MODEL, CLASS_NAMES
 
     if MODEL is None:
-        checkpoint = torch.load(cfg["checkpoint_path"], map_location="cpu")
+        import gdown
+
+        # Absolute path (robust for Streamlit Cloud)
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        MODEL_PATH = os.path.join(BASE_DIR, cfg["checkpoint_path"])
+
+        # Google Drive file ID (NOT full link)
+        MODEL_URL = "https://drive.google.com/uc?id=1OJ_0ckqRI4xGp-MpYa3FgjhEntL_pHe4"
+
+        # Download if not exists
+        if not os.path.exists(MODEL_PATH):
+            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+            print("Downloading model...")
+            gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+
+        # Load model (PyTorch 2.6 fix)
+        checkpoint = torch.load(
+            MODEL_PATH,
+            map_location="cpu",
+            weights_only=False
+        )
+
+        # Initialize model
         MODEL = CNNModel(num_classes=cfg["num_classes"])
-        MODEL.load_state_dict(checkpoint["state_dict"])
+
+        # Flexible loading
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            MODEL.load_state_dict(checkpoint["state_dict"])
+        else:
+            MODEL.load_state_dict(checkpoint)
+
         MODEL.eval()
 
-        CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
+        # Load class names once
+        if CLASS_NAMES is None:
+            CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
 
     return MODEL, CLASS_NAMES
-
 
 # ---------------------------------------------------------------------------
 # Preprocessing
