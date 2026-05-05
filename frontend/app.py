@@ -1,34 +1,21 @@
-"""
-frontend/app.py — AgriVision Streamlit Frontend
-Run : streamlit run frontend/app.py
-"""
-
 import os
 import sys
+import tempfile
+import logging
 
-# 🔥 FORCE absolute project root
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import streamlit as st
 from inference.predictor import predict
-import tempfile
-import logging
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-MODEL_VERSION = "v1"   # 🔁 change when model updates
-
-
-# ---------------------------------------------------------------------------
-# Logging (minimal)
-# ---------------------------------------------------------------------------
+from utils.visualize import overlay_heatmap_on_image
+from PIL import Image
+import numpy as np
 
 logging.basicConfig(level=logging.ERROR)
+
+MODEL_VERSION = "v1"
 
 
 # ---------------------------------------------------------------------------
@@ -55,26 +42,42 @@ def get_advice(label: str) -> str | None:
 
 
 def format_label(label: str) -> str:
-    return label.replace('_', ' ').title()
+    return label.replace("_", " ").title()
 
 
 # ---------------------------------------------------------------------------
-# Cached Prediction
+# Cached prediction (no Grad-CAM)
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def cached_predict(image_bytes: bytes, model_version: str):
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    try:
+def cached_predict(image_bytes: bytes, model_version: str) -> list[dict]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         tmp.write(image_bytes)
-        tmp.flush()
-        tmp.close()  # important for Windows
+        tmp_path = tmp.name
 
-        return predict(tmp.name)
-
+    try:
+        return predict(tmp_path, return_heatmap=False)
     finally:
         try:
-            os.remove(tmp.name)
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Grad-CAM prediction (no caching)
+# ---------------------------------------------------------------------------
+
+def gradcam_predict(image_bytes: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+
+    try:
+        return predict(tmp_path, return_heatmap=True)
+    finally:
+        try:
+            os.remove(tmp_path)
         except Exception:
             pass
 
@@ -86,99 +89,123 @@ def cached_predict(image_bytes: bytes, model_version: str):
 def main() -> None:
     st.set_page_config(page_title="AgriVision", page_icon="🌿", layout="centered")
 
-    # Header
     st.title("🌿 AgriVision — Crop Disease Detection")
-    st.caption("⚡ First prediction may take ~30–60 seconds (model will download once)")
-    st.caption("Upload a crop image to detect potential diseases and receive care advice.")
+    st.caption("⚡ First prediction may take ~30–60 seconds (model loads once)")
+    st.caption("Upload a crop image to detect diseases and get recommendations.")
 
-    # Upload
     uploaded_file = st.file_uploader(
         "Upload a crop leaf image",
         type=["jpg", "jpeg", "png"],
-        help="Use a clear leaf image (max ~5MB). Center the leaf and avoid blur."
+        help="Use a clear leaf image (max ~5MB).",
     )
 
-    # File size guard
     if uploaded_file and uploaded_file.size > 5 * 1024 * 1024:
         st.error("File too large (>5MB). Please upload a smaller image.")
         return
 
-    if uploaded_file:
-        st.info("📸 Tip: Use a clear, close-up image of a single leaf for best accuracy.")
+    if not uploaded_file:
+        return
 
-        # Preview
-        st.image(uploaded_file, caption="Uploaded Image", width=320)
+    st.info("📸 Tip: Use a clear, close-up image of a single leaf.")
+
+    image_bytes = uploaded_file.getvalue()
+    pil_image = Image.open(uploaded_file).convert("RGB")
+
+    show_gradcam = st.toggle("Show Grad-CAM Heatmap", value=False)
+
+    # ------------------------------------------------------------------
+    # Image preview
+    # ------------------------------------------------------------------
+
+    if not show_gradcam:
+        st.image(pil_image, caption="Uploaded Image", width=320)
         st.write("")
 
-        # Convert once
-        image_bytes = uploaded_file.getvalue()
+    # ------------------------------------------------------------------
+    # Prediction
+    # ------------------------------------------------------------------
 
-        # Predict
-        with st.spinner("Analysing image… (first run may take ~30–60 seconds)"):
-            try:
+    with st.spinner("Analyzing image..."):
+        try:
+            if show_gradcam:
+                result = gradcam_predict(image_bytes)
+                predictions = result.get("predictions", [])
+                heatmap = result.get("heatmap", None)
+            else:
                 predictions = cached_predict(image_bytes, MODEL_VERSION)
+                heatmap = None
 
-                if not predictions:
-                    st.error("No predictions returned. Try another image.")
-                    return
-
-            except Exception as exc:
-                logging.error(str(exc))
-                st.error("⚠️ Inference failed. Please try another image or refresh.")
+            if not predictions:
+                st.error("No predictions returned. Try another image.")
                 return
 
-        # Results
+        except Exception as exc:
+            logging.error(str(exc))
+            st.error("⚠️ Inference failed. Please try another image.")
+            return
+
+    # ------------------------------------------------------------------
+    # Heatmap display
+    # ------------------------------------------------------------------
+
+    if show_gradcam:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.image(pil_image, caption="Original", use_container_width=True)
+
+        with col2:
+            if heatmap is not None:
+                heatmap = np.clip(heatmap, 0, 1)
+                overlay = overlay_heatmap_on_image(pil_image, heatmap)
+                st.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+            else:
+                st.warning("Heatmap unavailable.")
+                st.image(pil_image, caption="Original", use_container_width=True)
+
         st.write("")
-        st.subheader("Top Predictions")
 
-        top = predictions[0]
-        st.success(
-            f"Most likely: **{format_label(top['label'])}** "
-            f"({top['confidence']*100:.2f}%)"
-        )
+    # ------------------------------------------------------------------
+    # Results
+    # ------------------------------------------------------------------
 
-        # 🔥 Unknown detection logic
+    st.subheader("Top Predictions")
 
-        if top["confidence"] < 0.5:
-            st.error("❌ Unsupported or unclear image. Please upload a valid crop leaf.")
-        if top["confidence"] < 0.7:
-            st.warning(
-                "⚠️ Low confidence prediction.\n\n"
-                "This image may not belong to supported crops (Tomato, Potato, Corn). "
-                "Please verify manually." 
-            )
+    # Ensure sorted predictions (robust)
+    predictions = sorted(predictions, key=lambda x: x["confidence"], reverse=True)
 
-        
+    top = predictions[0]
+    st.success(
+        f"Most likely: **{format_label(top['label'])}** "
+        f"({top['confidence'] * 100:.2f}%)"
+    )
 
-        # Top-K display
-        for rank, pred in enumerate(predictions, start=1):
-            label = pred["label"]
-            confidence = pred["confidence"]
-            status = get_confidence_status(confidence)
-            pct = f"{confidence * 100:.2f}%"
+    if top["confidence"] < 0.5:
+        st.error("❌ Unsupported or unclear image.")
+    elif top["confidence"] < 0.7:
+        st.warning("⚠️ Low confidence prediction. Please verify manually.")
 
-            with st.container(border=True):
-                col_rank, col_label, col_conf, col_status = st.columns([0.5, 3, 1.5, 2.5])
-                col_rank.markdown(f"**#{rank}**")
-                col_label.markdown(f"**{format_label(label)}**")
-                col_conf.markdown(f"`{pct}`")
-                col_status.markdown(status)
+    for rank, pred in enumerate(predictions, start=1):
+        label = pred["label"]
+        confidence = pred["confidence"]
+        status = get_confidence_status(confidence)
 
-                st.progress(max(1, min(int(confidence * 100), 100)))
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([0.5, 3, 1.5, 2.5])
+            c1.markdown(f"**#{rank}**")
+            c2.markdown(f"**{format_label(label)}**")
+            c3.markdown(f"`{confidence*100:.2f}%`")
+            c4.markdown(status)
+            st.progress(confidence)  # ✔ fixed
 
-            # Recommendation
+        if rank == 1:
             advice = get_advice(label)
-            if rank == 1 and advice:
+            if advice:
                 st.info(f"💡 Recommendation: {advice}")
 
-    # Footer
     st.divider()
-    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9 • Output: Top-3 predictions")
+    st.caption("Model: ResNet50 • Input: 224×224 • Classes: 9 • Top-3 predictions")
 
-
-# ---------------------------------------------------------------------------
-# Entry Point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

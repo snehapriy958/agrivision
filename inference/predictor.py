@@ -1,111 +1,93 @@
-"""
-inference/predictor.py — Single-Image Inference for CNN Image Classifier
-Dependencies : torch, torchvision, Pillow
-Usage        : from inference.predictor import predict
-               results = predict("path/to/image.jpg")
-"""
-
 import os
-import streamlit as st
+import sys
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
+from typing import Tuple, List, Dict, Union
+from typing import Optional
 
-from models.cnn_baseline import CNNModel
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from models.cnn_baseline import PlantDiseaseResNet
 from inference.preprocess import PlantDataset
+from utils.gradcam import GradCAM
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 CONFIG = {
-    "checkpoint_path" : "models/best_model.pth",
-    "data_root"       : "data/raw",
-    "num_classes"     : 9,
-    "top_k"           : 3,
-    "image_size"      : 224,
-    "mean"            : [0.485, 0.456, 0.406],
-    "std"             : [0.229, 0.224, 0.225],
+    "checkpoint_path": "models/best_model.pth",
+    "data_root": "data/raw",
+    "num_classes": 9,
+    "top_k": 3,
+    "image_size": 224,
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225],
 }
 
-MODEL, CLASS_NAMES = None, None
+_MODEL: Optional[PlantDiseaseResNet] = None
+_CLASS_NAMES: Optional[List[str]] = None
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Load model
+# ---------------------------------------------------------------------
 
-@st.cache_resource
-def load_model(cfg: dict = CONFIG):
-    global MODEL, CLASS_NAMES
+def load_model(cfg: dict = CONFIG) -> Tuple[PlantDiseaseResNet, List[str]]:
+    global _MODEL, _CLASS_NAMES
 
-    if MODEL is None:
-        import gdown
+    if _MODEL is not None:
+        return _MODEL, _CLASS_NAMES
 
-        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        MODEL_PATH = os.path.join(BASE_DIR, cfg["checkpoint_path"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        MODEL_URL = "https://drive.google.com/uc?id=1OJ_0ckqRI4xGp-MpYa3FgjhEntL_pHe4"
+    if not os.path.exists(cfg["checkpoint_path"]):
+        raise FileNotFoundError(f"Checkpoint not found: {cfg['checkpoint_path']}")
 
-        # Download model if not present
-        if not os.path.exists(MODEL_PATH):
-            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-            print("Downloading model...")
-            gdown.download(MODEL_URL, MODEL_PATH, quiet=False, fuzzy=True)
+    checkpoint = torch.load(cfg["checkpoint_path"], map_location=device)
 
-        # Load model
-        checkpoint = torch.load(
-            MODEL_PATH,
-            map_location="cpu",
-            weights_only=False
-        )
+    model = PlantDiseaseResNet(num_classes=cfg["num_classes"])
+    state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
 
-        MODEL = CNNModel(num_classes=cfg["num_classes"])
+    model.to(device)
+    model.eval()
 
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            MODEL.load_state_dict(checkpoint["state_dict"])
-        else:
-            MODEL.load_state_dict(checkpoint)
+    _MODEL = model
+    _CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
 
-        MODEL.eval()
+    return _MODEL, _CLASS_NAMES
 
-        if CLASS_NAMES is None:
-            CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
 
-    return MODEL, CLASS_NAMES
-
-# ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Preprocess
+# ---------------------------------------------------------------------
 
 def preprocess_image(image_path: str, cfg: dict = CONFIG) -> torch.Tensor:
-    """Open, transform, and batch a single image."""
     transform = transforms.Compose([
         transforms.Resize((cfg["image_size"], cfg["image_size"])),
         transforms.ToTensor(),
         transforms.Normalize(mean=cfg["mean"], std=cfg["std"]),
     ])
 
-    image = Image.open(image_path).convert("RGB")
-    return transform(image).unsqueeze(0)          # (1, 3, 224, 224)
+    try:
+        image = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        raise ValueError(f"Invalid image: {image_path}") from e
+
+    return transform(image).unsqueeze(0)
 
 
-# ---------------------------------------------------------------------------
-# Prediction
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Predictions
+# ---------------------------------------------------------------------
 
-def predict(image_path: str, cfg: dict = CONFIG):
-    model, class_names = load_model(cfg)
-    tensor = preprocess_image(image_path, cfg)
-
-    with torch.no_grad():
-        logits = model(tensor)
-        probs = F.softmax(logits, dim=1)
-
-    top_probs, top_indices = torch.topk(probs, k=cfg["top_k"], dim=1)
-
+def _top_k_predictions(
+    probs: torch.Tensor,
+    class_names: List[str],
+    top_k: int,
+) -> List[Dict]:
+    top_probs, top_indices = torch.topk(probs, k=top_k, dim=1)
     return [
         {
             "label": class_names[idx.item()],
@@ -114,22 +96,81 @@ def predict(image_path: str, cfg: dict = CONFIG):
         for prob, idx in zip(top_probs[0], top_indices[0])
     ]
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Main predict
+# ---------------------------------------------------------------------
+
+def predict(
+    image_path: str,
+    cfg: dict = CONFIG,
+    return_heatmap: bool = False,
+) -> Union[List[Dict[str, Union[str, float]]], Dict[str, object]]:
+
+    model, class_names = load_model(cfg)
+    device = next(model.parameters()).device
+    tensor = preprocess_image(image_path, cfg).to(device)
+
+    # ---------------- NORMAL INFERENCE ----------------
+    if not return_heatmap:
+        with torch.inference_mode():
+            probs = F.softmax(model(tensor), dim=1)
+        return _top_k_predictions(probs, class_names, cfg["top_k"])
+
+    # ---------------- GRAD-CAM ----------------
+    heatmap = None
+    probs = None
+    gradcam = GradCAM(model, target_layer=model.model.layer4)
+
+    try:
+        
+        logits = model(tensor)
+        probs = F.softmax(logits, dim=1)
+
+        top_idx = int(probs.argmax(dim=1).item())
+        heatmap = gradcam.generate(tensor, class_idx=top_idx)
+
+    except Exception as exc:
+        print(f"[GradCAM] Warning: {exc}")
+        heatmap = None
+
+        if probs is None:
+            with torch.inference_mode():
+                probs = F.softmax(model(tensor), dim=1)
+
+    finally:
+        gradcam.remove_hooks()
+
+    return {
+        "predictions": _top_k_predictions(probs, class_names, cfg["top_k"]),
+        "heatmap": heatmap,
+    }
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) != 2:
-        print("Usage: python inference/predictor.py <image_path>")
+    if len(sys.argv) not in (2, 3):
+        print("Usage: python inference/predictor.py <image_path> [--heatmap]")
         sys.exit(1)
 
-    results = predict(sys.argv[1])
+    image_path = sys.argv[1]
+    want_heatmap = len(sys.argv) == 3 and sys.argv[2] == "--heatmap"
+
+    results = predict(image_path, return_heatmap=want_heatmap)
+
+    predictions = results["predictions"] if want_heatmap else results
+    heatmap = results.get("heatmap") if want_heatmap else None
 
     print("\nTop-3 Predictions")
     print("-" * 35)
-    for rank, result in enumerate(results, start=1):
-        confidence_pct = result["confidence"] * 100
-        print(f"  {rank}. {result['label']:<20} {confidence_pct:>6.2f}%")
-    print()
+    for i, r in enumerate(predictions, 1):
+        print(f"{i}. {r['label']} ({r['confidence']*100:.2f}%)")
+
+    if want_heatmap:
+        if heatmap is not None:
+            print(f"\nHeatmap: shape={heatmap.shape}")
+        else:
+            print("\nHeatmap unavailable")
