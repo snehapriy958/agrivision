@@ -21,7 +21,7 @@ MODEL_VERSION = "v1"
 
 
 # ---------------------------------------------------------------------------
-# Model preload (IMPORTANT FIX)
+# Model preload
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
@@ -33,10 +33,14 @@ def load_model_once():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_confidence_status(confidence: float) -> str:
-    if confidence > 0.8:
+def get_confidence_status(top1: float, top2: float) -> str:
+    gap = top1 - top2
+
+    if gap < 0.2:
+        return "⚠️ Uncertain prediction"
+    elif top1 > 0.8:
         return "✅ High confidence"
-    elif confidence > 0.5:
+    elif top1 > 0.5:
         return "⚠️ Moderate confidence"
     return "❌ Low confidence"
 
@@ -57,7 +61,7 @@ def format_label(label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Cached prediction (no Grad-CAM)
+# Cached prediction
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
@@ -76,7 +80,7 @@ def cached_predict(image_bytes: bytes, model_version: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Grad-CAM prediction (no caching)
+# Grad-CAM prediction
 # ---------------------------------------------------------------------------
 
 def gradcam_predict(image_bytes: bytes) -> Dict:
@@ -100,21 +104,19 @@ def gradcam_predict(image_bytes: bytes) -> Dict:
 def main() -> None:
     st.set_page_config(page_title="AgriVision", page_icon="🌿", layout="centered")
 
-    # ✅ Load model once (FIXED)
     load_model_once()
 
     st.title("🌿 AgriVision — Crop Disease Detection")
-    st.caption("⚡ First prediction may take ~30–60 seconds (model loads once)")
+    st.caption("⚡ First prediction may take ~30–60 seconds")
     st.caption("Upload a crop image to detect diseases and get recommendations.")
 
     uploaded_file = st.file_uploader(
         "Upload a crop leaf image",
         type=["jpg", "jpeg", "png"],
-        help="Use a clear leaf image (max ~5MB).",
     )
 
     if uploaded_file and uploaded_file.size > 5 * 1024 * 1024:
-        st.error("File too large (>5MB). Please upload a smaller image.")
+        st.error("File too large (>5MB).")
         return
 
     if not uploaded_file:
@@ -127,13 +129,8 @@ def main() -> None:
 
     show_gradcam = st.toggle("🔬 Enable Explainability (Grad-CAM)", value=False)
 
-    # ------------------------------------------------------------------
-    # Image preview
-    # ------------------------------------------------------------------
-
     if not show_gradcam:
         st.image(pil_image, caption="Uploaded Image", width=320)
-        st.write("")
 
     # ------------------------------------------------------------------
     # Prediction
@@ -142,7 +139,6 @@ def main() -> None:
     with st.spinner("Analyzing image..."):
         try:
             if show_gradcam:
-                st.caption("⚠️ Grad-CAM may take slightly longer")
                 result = gradcam_predict(image_bytes)
                 predictions = result.get("predictions", [])
                 heatmap = result.get("heatmap", None)
@@ -151,7 +147,7 @@ def main() -> None:
                 heatmap = None
 
             if not predictions:
-                st.error("No predictions returned. Try another image.")
+                st.error("No predictions returned.")
                 return
 
         except Exception as e:
@@ -161,7 +157,7 @@ def main() -> None:
             return
 
     # ------------------------------------------------------------------
-    # Heatmap display
+    # Heatmap
     # ------------------------------------------------------------------
 
     if show_gradcam:
@@ -177,9 +173,7 @@ def main() -> None:
                 st.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
             else:
                 st.warning("Heatmap unavailable.")
-                st.image(pil_image, caption="Original", use_container_width=True)
-
-        st.write("")
+                st.image(pil_image, use_container_width=True)
 
     # ------------------------------------------------------------------
     # Results
@@ -191,27 +185,50 @@ def main() -> None:
 
     top = predictions[0]
     conf = top["confidence"]
+
+    top1 = predictions[0]["confidence"]
+    top2 = predictions[1]["confidence"] if len(predictions) > 1 else 0.0
+    gap = top1 - top2
+
     conf_display = max(min(conf, 0.999), 0.001)
-    st.success(
-        f"Most likely: **{format_label(top['label'])}** "
-        f"({conf_display * 100:.2f}%)"
-    )
-    
-    if conf < 0.3:
-        st.error("❌ Model is not reliable. Likely due to poor image or domain mismatch.")
-        return
-    elif conf < 0.6:
-        st.warning("⚠️ Low confidence — try a clearer, close-up leaf image.")
-    elif conf < 0.8:
-        st.info("ℹ️ Moderate confidence — verify the result.")
+
+    # ✅ Better diagnosis output
+    if gap < 0.2:
+        final_label = f"Possible {format_label(predictions[0]['label'])} or {format_label(predictions[1]['label'])}"
+    else:
+        final_label = format_label(predictions[0]['label'])
+
+    st.success(f"Diagnosis: **{final_label}** ({conf_display * 100:.2f}%)")
+
+    # ✅ Secondary risk alert
+    if len(predictions) > 1:
+        second = predictions[1]
+        if "blight" in second["label"].lower():
+            st.warning(
+                f"⚠️ Secondary risk detected: {format_label(second['label'])} "
+                f"({second['confidence']*100:.2f}%)"
+            )
+
+    # ✅ Confidence logic
+    if conf < 0.4:
+        st.error("❌ Very low confidence — unreliable prediction.")
+    elif gap < 0.2:
+        st.warning("⚠️ Ambiguous prediction — similar probabilities detected.")
+    elif conf < 0.7:
+        st.info("ℹ️ Moderate confidence — verify result.")
     else:
         st.success("✅ High confidence in prediction.")
+
+    # ------------------------------------------------------------------
+    # Prediction list
+    # ------------------------------------------------------------------
 
     for rank, pred in enumerate(predictions, start=1):
         label = pred["label"]
         confidence = pred["confidence"]
         confidence_display = max(min(confidence, 0.999), 0.001)
-        status = get_confidence_status(confidence)
+
+        status = get_confidence_status(top1, top2)
 
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([0.5, 3, 1.5, 2.5])
@@ -227,7 +244,7 @@ def main() -> None:
                 st.info(f"💡 Recommendation: {advice}")
 
     st.divider()
-    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9 • Top-3 predictions")
+    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9")
 
 
 if __name__ == "__main__":
