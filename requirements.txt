@@ -1,7 +1,6 @@
-gdown
 torch
 torchvision
 streamlit
+opencv-python
 pillow
 numpy
-scikit-learn
