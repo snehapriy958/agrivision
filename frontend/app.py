@@ -130,7 +130,7 @@ def main() -> None:
     show_gradcam = st.toggle("🔬 Enable Explainability (Grad-CAM)", value=False)
 
     if not show_gradcam:
-        st.image(pil_image, caption="Uploaded Image", width=320)
+        st.image(pil_image, caption="Original", width=400)
 
     # ------------------------------------------------------------------
     # Prediction
@@ -164,16 +164,16 @@ def main() -> None:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.image(pil_image, caption="Original", use_container_width=True)
+            st.image(pil_image, caption="Original", width=400)
 
         with col2:
             if heatmap is not None:
                 heatmap = np.clip(heatmap, 0, 1)
                 overlay = overlay_heatmap_on_image(pil_image, heatmap)
-                st.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+                st.image(overlay, caption="Grad-CAM Overlay", width=400)
             else:
                 st.warning("Heatmap unavailable.")
-                st.image(pil_image, use_container_width=True)
+                st.image(pil_image, width=400)
 
     # ------------------------------------------------------------------
     # Results
