@@ -1,4 +1,5 @@
 import os
+import io
 import sys
 import tempfile
 import logging
@@ -8,14 +9,24 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 import streamlit as st
-from inference.predictor import predict
+from inference.predictor import predict, load_model
 from utils.visualize import overlay_heatmap_on_image
 from PIL import Image
 import numpy as np
+from typing import Optional, List, Dict
 
 logging.basicConfig(level=logging.ERROR)
 
 MODEL_VERSION = "v1"
+
+
+# ---------------------------------------------------------------------------
+# Model preload (IMPORTANT FIX)
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def load_model_once():
+    load_model()
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +41,7 @@ def get_confidence_status(confidence: float) -> str:
     return "❌ Low confidence"
 
 
-def get_advice(label: str) -> str | None:
+def get_advice(label: str) -> Optional[str]:
     label_lower = label.lower()
     if "blight" in label_lower:
         return "Use fungicide and avoid overwatering."
@@ -50,7 +61,7 @@ def format_label(label: str) -> str:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def cached_predict(image_bytes: bytes, model_version: str) -> list[dict]:
+def cached_predict(image_bytes: bytes, model_version: str) -> List[Dict]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         tmp.write(image_bytes)
         tmp_path = tmp.name
@@ -68,7 +79,7 @@ def cached_predict(image_bytes: bytes, model_version: str) -> list[dict]:
 # Grad-CAM prediction (no caching)
 # ---------------------------------------------------------------------------
 
-def gradcam_predict(image_bytes: bytes) -> dict:
+def gradcam_predict(image_bytes: bytes) -> Dict:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         tmp.write(image_bytes)
         tmp_path = tmp.name
@@ -88,6 +99,9 @@ def gradcam_predict(image_bytes: bytes) -> dict:
 
 def main() -> None:
     st.set_page_config(page_title="AgriVision", page_icon="🌿", layout="centered")
+
+    # ✅ Load model once (FIXED)
+    load_model_once()
 
     st.title("🌿 AgriVision — Crop Disease Detection")
     st.caption("⚡ First prediction may take ~30–60 seconds (model loads once)")
@@ -109,9 +123,9 @@ def main() -> None:
     st.info("📸 Tip: Use a clear, close-up image of a single leaf.")
 
     image_bytes = uploaded_file.getvalue()
-    pil_image = Image.open(uploaded_file).convert("RGB")
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    show_gradcam = st.toggle("Show Grad-CAM Heatmap", value=False)
+    show_gradcam = st.toggle("🔬 Enable Explainability (Grad-CAM)", value=False)
 
     # ------------------------------------------------------------------
     # Image preview
@@ -128,6 +142,7 @@ def main() -> None:
     with st.spinner("Analyzing image..."):
         try:
             if show_gradcam:
+                st.caption("⚠️ Grad-CAM may take slightly longer")
                 result = gradcam_predict(image_bytes)
                 predictions = result.get("predictions", [])
                 heatmap = result.get("heatmap", None)
@@ -139,9 +154,9 @@ def main() -> None:
                 st.error("No predictions returned. Try another image.")
                 return
 
-        except Exception as exc:
-            logging.error(str(exc))
-            st.error("⚠️ Inference failed. Please try another image.")
+        except Exception:
+            logging.exception("Inference error")
+            st.error("⚠️ Inference failed. Try a clear leaf image or check model.")
             return
 
     # ------------------------------------------------------------------
@@ -171,7 +186,6 @@ def main() -> None:
 
     st.subheader("Top Predictions")
 
-    # Ensure sorted predictions (robust)
     predictions = sorted(predictions, key=lambda x: x["confidence"], reverse=True)
 
     top = predictions[0]
@@ -196,7 +210,7 @@ def main() -> None:
             c2.markdown(f"**{format_label(label)}**")
             c3.markdown(f"`{confidence*100:.2f}%`")
             c4.markdown(status)
-            st.progress(confidence)  # ✔ fixed
+            st.progress(confidence)
 
         if rank == 1:
             advice = get_advice(label)
