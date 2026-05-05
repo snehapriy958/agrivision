@@ -81,8 +81,17 @@ def load_model(cfg: dict = CONFIG) -> Tuple[CNNModel, List[str]]:
     model.eval()
 
     _MODEL = model
-    _CLASS_NAMES = PlantDataset(root_dir=cfg["data_root"]).class_names
-
+    _CLASS_NAMES = [
+        "Corn Cercospora Leaf Spot",
+        "Corn Common Rust",
+        "Corn Healthy",
+        "Potato Early Blight",
+        "Potato Healthy",
+        "Potato Late Blight",
+        "Tomato Early Blight",
+        "Tomato Healthy",
+        "Tomato Late Blight",
+    ]
     return _MODEL, _CLASS_NAMES
 
 
