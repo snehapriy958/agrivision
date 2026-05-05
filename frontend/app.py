@@ -154,9 +154,10 @@ def main() -> None:
                 st.error("No predictions returned. Try another image.")
                 return
 
-        except Exception:
-            logging.exception("Inference error")
-            st.error("⚠️ Inference failed. Try a clear leaf image or check model.")
+        except Exception as e:
+            import traceback
+            st.error(f"Inference failed: {str(e)}")
+            st.text(traceback.format_exc())
             return
 
     # ------------------------------------------------------------------
@@ -193,11 +194,16 @@ def main() -> None:
         f"Most likely: **{format_label(top['label'])}** "
         f"({top['confidence'] * 100:.2f}%)"
     )
+    
+    if top["confidence"] < 0.3:
+        st.error("❌ Model is not reliable. Likely due to incomplete training.")
+        return
+    elif top["confidence"] < 0.6:
+        st.warning("⚠️ Low confidence. Try a clearer leaf image.")
+      
 
-    if top["confidence"] < 0.5:
-        st.error("❌ Unsupported or unclear image.")
-    elif top["confidence"] < 0.7:
-        st.warning("⚠️ Low confidence prediction. Please verify manually.")
+    elif top["confidence"] < 0.8:
+        st.info("ℹ️ Moderate confidence. Verify result.")
 
     for rank, pred in enumerate(predictions, start=1):
         label = pred["label"]
@@ -218,7 +224,7 @@ def main() -> None:
                 st.info(f"💡 Recommendation: {advice}")
 
     st.divider()
-    st.caption("Model: ResNet50 • Input: 224×224 • Classes: 9 • Top-3 predictions")
+    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9 • Top-3 predictions")
 
 
 if __name__ == "__main__":

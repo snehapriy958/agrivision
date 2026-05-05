@@ -1,23 +1,48 @@
 import os
 import sys
+import logging
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
-from typing import Tuple, List, Dict, Union
-from typing import Optional
+from typing import Tuple, List, Dict, Union, Optional
+
+import gdown
+
+# ---------------------------------------------------------------------
+# MODEL DOWNLOAD CONFIG
+# ---------------------------------------------------------------------
+
+MODEL_PATH = "models/best_model.pth"
+MODEL_URL = "https://drive.google.com/uc?id=1JKlHmyCNOrVSIlfyHtSADj2u2BnotDFv"
+
+# Download model if missing
+if not os.path.exists(MODEL_PATH):
+    os.makedirs("models", exist_ok=True)
+    print("Downloading model...")
+    try:
+        gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+    except Exception as e:
+        raise RuntimeError("Model download failed") from e
+
+# Final check
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError("Model file missing after download")
+
+# ---------------------------------------------------------------------
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.cnn_baseline import PlantDiseaseResNet
+from models.cnn_baseline import CNNModel
 from inference.preprocess import PlantDataset
 from utils.gradcam import GradCAM
 
+# ---------------------------------------------------------------------
 
 CONFIG = {
-    "checkpoint_path": "models/best_model.pth",
+    "checkpoint_path": MODEL_PATH,
     "data_root": "data/raw",
     "num_classes": 9,
     "top_k": 3,
@@ -26,14 +51,16 @@ CONFIG = {
     "std": [0.229, 0.224, 0.225],
 }
 
-_MODEL: Optional[PlantDiseaseResNet] = None
+_MODEL: Optional[CNNModel] = None
 _CLASS_NAMES: Optional[List[str]] = None
 
+logging.basicConfig(level=logging.WARNING)
+
 # ---------------------------------------------------------------------
-# Load model
+# LOAD MODEL
 # ---------------------------------------------------------------------
 
-def load_model(cfg: dict = CONFIG) -> Tuple[PlantDiseaseResNet, List[str]]:
+def load_model(cfg: dict = CONFIG) -> Tuple[CNNModel, List[str]]:
     global _MODEL, _CLASS_NAMES
 
     if _MODEL is not None:
@@ -41,13 +68,13 @@ def load_model(cfg: dict = CONFIG) -> Tuple[PlantDiseaseResNet, List[str]]:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if not os.path.exists(cfg["checkpoint_path"]):
-        raise FileNotFoundError(f"Checkpoint not found: {cfg['checkpoint_path']}")
-
     checkpoint = torch.load(cfg["checkpoint_path"], map_location=device)
 
-    model = PlantDiseaseResNet(num_classes=cfg["num_classes"])
+    model = CNNModel(num_classes=cfg["num_classes"])
+
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+
+    # ✅ CLEAN LOAD (NO FILTERING)
     model.load_state_dict(state_dict)
 
     model.to(device)
@@ -60,7 +87,7 @@ def load_model(cfg: dict = CONFIG) -> Tuple[PlantDiseaseResNet, List[str]]:
 
 
 # ---------------------------------------------------------------------
-# Preprocess
+# PREPROCESS
 # ---------------------------------------------------------------------
 
 def preprocess_image(image_path: str, cfg: dict = CONFIG) -> torch.Tensor:
@@ -79,7 +106,7 @@ def preprocess_image(image_path: str, cfg: dict = CONFIG) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------
-# Predictions
+# TOP-K PREDICTIONS
 # ---------------------------------------------------------------------
 
 def _top_k_predictions(
@@ -88,6 +115,7 @@ def _top_k_predictions(
     top_k: int,
 ) -> List[Dict]:
     top_probs, top_indices = torch.topk(probs, k=top_k, dim=1)
+
     return [
         {
             "label": class_names[idx.item()],
@@ -98,7 +126,7 @@ def _top_k_predictions(
 
 
 # ---------------------------------------------------------------------
-# Main predict
+# MAIN PREDICT FUNCTION
 # ---------------------------------------------------------------------
 
 def predict(
@@ -120,10 +148,10 @@ def predict(
     # ---------------- GRAD-CAM ----------------
     heatmap = None
     probs = None
-    gradcam = GradCAM(model, target_layer=model.model.layer4)
+
+    gradcam = GradCAM(model, target_layer=model.features[-1])
 
     try:
-        
         logits = model(tensor)
         probs = F.softmax(logits, dim=1)
 
@@ -131,7 +159,7 @@ def predict(
         heatmap = gradcam.generate(tensor, class_idx=top_idx)
 
     except Exception as exc:
-        print(f"[GradCAM] Warning: {exc}")
+        logging.warning(f"[GradCAM] {exc}")
         heatmap = None
 
         if probs is None:
@@ -148,7 +176,7 @@ def predict(
 
 
 # ---------------------------------------------------------------------
-# CLI
+# CLI (TEST)
 # ---------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -166,6 +194,7 @@ if __name__ == "__main__":
 
     print("\nTop-3 Predictions")
     print("-" * 35)
+
     for i, r in enumerate(predictions, 1):
         print(f"{i}. {r['label']} ({r['confidence']*100:.2f}%)")
 

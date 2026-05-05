@@ -1,251 +1,137 @@
 import os
+import sys
+
+# ---------------- FIX IMPORT PATH ----------------
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset, random_split
-from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
-from torchvision import transforms
-from torch.cuda.amp import autocast, GradScaler
-from typing import Tuple
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, random_split
 
-from models.cnn_baseline import PlantDiseaseResNet
-from inference.preprocess import PlantDataset
+from models.cnn_baseline import CNNModel
 
 
+# ---------------- CONFIG ----------------
 CONFIG = {
-    "data_root": "data/raw",
-    "num_classes": 9,
+    "data_dir": "data/raw",
     "batch_size": 32,
-    "num_epochs": 30,
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-4,
-    "val_split": 0.2,
-    "num_workers": 0,
+    "epochs": 10,
+    "lr": 1e-3,
+    "image_size": 224,
+    "num_classes": 9,
     "checkpoint_path": "models/best_model.pth",
-    "seed": 42,
-    "step_size": 5,
-    "gamma": 0.3,
-    "patience": 5,
 }
 
-
-TRAIN_TRANSFORMS = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-VAL_TRANSFORMS = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
+# ---------------- TRAIN FUNCTION ----------------
+def train():
 
+    # ---------------- TRANSFORMS ----------------
+    train_transforms = transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.RandomResizedCrop(CONFIG["image_size"]),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225]),
+    ])
 
-# ---------------------------------------------------------------------
-# Utils
-# ---------------------------------------------------------------------
+    val_transforms = transforms.Compose([
+        transforms.Resize((CONFIG["image_size"], CONFIG["image_size"])),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225]),
+    ])
 
-def set_seed(seed: int) -> None:
-    import random
-    import numpy as np
+    # ---------------- DATA ----------------
+    full_dataset = datasets.ImageFolder(CONFIG["data_dir"])
 
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
+    # Assign transforms
+    train_dataset.dataset.transform = train_transforms
+    val_dataset.dataset.transform = val_transforms
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ---------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------
-
-def build_dataloaders(cfg: dict) -> Tuple[DataLoader, DataLoader]:
-    base_dataset = PlantDataset(root_dir=cfg["data_root"])
-
-    total = len(base_dataset)
-    val_size = int(total * cfg["val_split"])
-    train_size = total - val_size
-
-    generator = torch.Generator().manual_seed(cfg["seed"])
-
-    train_split, val_split = random_split(
-        range(total), [train_size, val_size], generator=generator
-    )
-
-    train_dataset = PlantDataset(cfg["data_root"], transform=TRAIN_TRANSFORMS)
-    val_dataset = PlantDataset(cfg["data_root"], transform=VAL_TRANSFORMS)
-
-    # ✅ Consistent indices (fixes IDE + edge-case issues)
-    train_idx = list(train_split.indices)
-    val_idx = list(val_split.indices)
-
-    # ✅ Respect config but optimize GPU
-    num_workers = cfg["num_workers"]
-    if num_workers == 0 and torch.cuda.is_available():
-        num_workers = 2
-    
     train_loader = DataLoader(
-        Subset(train_dataset, train_idx),
-        batch_size=cfg["batch_size"],
+        train_dataset,
+        batch_size=CONFIG["batch_size"],
         shuffle=True,
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
-        pin_memory=torch.cuda.is_available(),
+        num_workers=0  # ✅ FIX for Windows
     )
 
     val_loader = DataLoader(
-        Subset(val_dataset, val_idx),
-        batch_size=cfg["batch_size"],
+        val_dataset,
+        batch_size=CONFIG["batch_size"],
         shuffle=False,
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
-        pin_memory=torch.cuda.is_available(),
+        num_workers=0
     )
 
-    print(f"Classes      : {base_dataset.class_names}")
-    print(f"Dataset      : {total:,} samples (train {train_size:,} | val {val_size:,})")
+    # ---------------- MODEL ----------------
+    model = CNNModel(num_classes=CONFIG["num_classes"]).to(device)
 
-    return train_loader, val_loader
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"])
 
+    # ---------------- TRAIN LOOP ----------------
+    best_acc = 0.0
 
-# ---------------------------------------------------------------------
-# Checkpoint
-# ---------------------------------------------------------------------
+    for epoch in range(CONFIG["epochs"]):
+        model.train()
+        total_loss = 0.0
 
-def save_checkpoint(model, optimizer, path, epoch, val_acc):
-    torch.save({
-        "epoch": epoch,
-        "val_acc": val_acc,
-        "state_dict": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-    }, path)
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
 
-
-# ---------------------------------------------------------------------
-# Train / Eval
-# ---------------------------------------------------------------------
-
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
-    model.train()
-    running_loss = 0.0
-
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with autocast(enabled=torch.cuda.is_available()):
+            optimizer.zero_grad()
             outputs = model(images)
             loss = criterion(outputs, labels)
 
-        scaler.scale(loss).backward()
+            loss.backward()
+            optimizer.step()
 
-        # ✅ Stability (prevents exploding gradients)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            total_loss += loss.item() * images.size(0)
 
-        scaler.step(optimizer)
-        scaler.update()
+        avg_loss = total_loss / len(train_loader.dataset)
 
-        running_loss += loss.item() * images.size(0)
+        # ---------------- VALIDATION ----------------
+        model.eval()
+        correct = 0
+        total = 0
 
-    return running_loss / len(loader.dataset)
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
 
+                outputs = model(images)
+                _, predicted = torch.max(outputs, 1)
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    correct = 0
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
 
-    for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        acc = correct / total
 
-        preds = model(images).argmax(dim=1)
-        correct += (preds == labels).sum().item()
+        print(f"Epoch {epoch+1}/{CONFIG['epochs']} | Loss: {avg_loss:.4f} | Acc: {acc:.4f}")
 
-    return 100.0 * correct / len(loader.dataset)
+        # ---------------- SAVE BEST MODEL ----------------
+        if acc > best_acc:
+            best_acc = acc
+            os.makedirs("models", exist_ok=True)
+            torch.save(model.state_dict(), CONFIG["checkpoint_path"])
+            print("✅ Best model saved")
 
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def train(cfg: dict) -> None:
-    set_seed(cfg["seed"])
-    device = get_device()
-
-    # ✅ Safe directory creation
-    checkpoint_dir = os.path.dirname(cfg["checkpoint_path"])
-    if checkpoint_dir:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    print(f"Device : {device} ({device_name})")
-
-    train_loader, val_loader = build_dataloaders(cfg)
-
-    model = PlantDiseaseResNet(cfg["num_classes"]).to(device)
-    criterion = nn.CrossEntropyLoss()
-
-    optimizer = Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"],
-    )
-
-    scheduler = StepLR(optimizer, cfg["step_size"], cfg["gamma"])
-    scaler = GradScaler(enabled=torch.cuda.is_available())
-
-    print(f"Trainable params : {model.count_parameters():,}\n")
-
-    best_val_acc = 0.0
-    no_improve_epochs = 0
-
-    for epoch in range(1, cfg["num_epochs"] + 1):
-
-        train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler
-        )
-
-        val_acc = evaluate(model, val_loader, device)
-        scheduler.step()
-
-        lr = optimizer.param_groups[0]["lr"]
-
-        print(f"Epoch {epoch:02d} | Loss: {train_loss:.4f} | Val: {val_acc:.2f}% | LR: {lr:.2e}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            no_improve_epochs = 0
-
-            save_checkpoint(model, optimizer, cfg["checkpoint_path"], epoch, val_acc)
-            print(f"         ↳ best model saved (val_acc={val_acc:.2f}%)")
-
-        else:
-            no_improve_epochs += 1
-
-            if no_improve_epochs >= cfg["patience"]:
-                print(f"\nEarly stopping triggered at epoch {epoch}")
-                break
-
-    print(f"\nTraining complete. Best val accuracy: {best_val_acc:.2f}%")
-    print(f"Checkpoint saved to: {cfg['checkpoint_path']}")
+    print(f"\n🎯 Final Best Accuracy: {best_acc:.4f}")
 
 
+# ---------------- MAIN ENTRY ----------------
 if __name__ == "__main__":
-    train(CONFIG)
+    train()

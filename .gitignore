@@ -1,5 +1,17 @@
+# Virtual env
 venv/
-data/
+
+# Python cache
 __pycache__/
 *.pyc
+
+# Data & models
+data/
 models/*.pth
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
