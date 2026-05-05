@@ -190,33 +190,36 @@ def main() -> None:
     predictions = sorted(predictions, key=lambda x: x["confidence"], reverse=True)
 
     top = predictions[0]
+    conf = top["confidence"]
+    conf_display = max(min(conf, 0.999), 0.001)
     st.success(
         f"Most likely: **{format_label(top['label'])}** "
-        f"({top['confidence'] * 100:.2f}%)"
+        f"({conf_display * 100:.2f}%)"
     )
     
-    if top["confidence"] < 0.3:
-        st.error("❌ Model is not reliable. Likely due to incomplete training.")
+    if conf < 0.3:
+        st.error("❌ Model is not reliable. Likely due to poor image or domain mismatch.")
         return
-    elif top["confidence"] < 0.6:
-        st.warning("⚠️ Low confidence. Try a clearer leaf image.")
-      
-
-    elif top["confidence"] < 0.8:
-        st.info("ℹ️ Moderate confidence. Verify result.")
+    elif conf < 0.6:
+        st.warning("⚠️ Low confidence — try a clearer, close-up leaf image.")
+    elif conf < 0.8:
+        st.info("ℹ️ Moderate confidence — verify the result.")
+    else:
+        st.success("✅ High confidence in prediction.")
 
     for rank, pred in enumerate(predictions, start=1):
         label = pred["label"]
         confidence = pred["confidence"]
+        confidence_display = max(min(confidence, 0.999), 0.001)
         status = get_confidence_status(confidence)
 
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([0.5, 3, 1.5, 2.5])
             c1.markdown(f"**#{rank}**")
             c2.markdown(f"**{format_label(label)}**")
-            c3.markdown(f"`{confidence*100:.2f}%`")
+            c3.markdown(f"`{confidence_display*100:.2f}%`")
             c4.markdown(status)
-            st.progress(confidence)
+            st.progress(confidence_display)
 
         if rank == 1:
             advice = get_advice(label)
