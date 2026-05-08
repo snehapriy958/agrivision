@@ -1,51 +1,117 @@
-import os
+"""
+frontend/app.py — AgriVision Streamlit Frontend
+Run : streamlit run frontend/app.py
+"""
+
 import io
+import os
 import sys
-import tempfile
 import logging
+import tempfile
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import streamlit as st
-from inference.predictor import predict, load_model
-from utils.visualize import overlay_heatmap_on_image
-from PIL import Image
 import numpy as np
-from typing import Optional, List, Dict
+import streamlit as st
+from PIL import Image
+
+from inference.predictor import load_model, predict
+from utils.visualize import overlay_heatmap_on_image
 
 logging.basicConfig(level=logging.ERROR)
 
 MODEL_VERSION = "v1"
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_FILE_BYTES  = 5 * 1024 * 1024     # 5 MB
+ENTROPY_LOW     = 0.5
+ENTROPY_HIGH    = 1.5
+CONF_CLAMP_MIN  = 0.001
+CONF_CLAMP_MAX  = 0.999
+GAP_AMBIGUOUS   = 0.2
+CONF_HIGH       = 0.8
+CONF_MODERATE   = 0.5
+
 
 # ---------------------------------------------------------------------------
-# Model preload
+# Model cache
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def load_model_once():
+@st.cache_resource(show_spinner="Loading model…")
+def load_model_once() -> None:
     load_model()
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Prediction helpers
 # ---------------------------------------------------------------------------
 
-def get_confidence_status(top1: float, top2: float) -> str:
+@st.cache_data(show_spinner=False)
+def cached_predict(image_bytes: bytes, _model_version: str) -> dict:
+    """Standard inference — result is cached per unique image."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+    try:
+        return predict(tmp_path, return_heatmap=False)
+    finally:
+        _safe_remove(tmp_path)
+
+def gradcam_predict(image_bytes: bytes) -> dict:
+    """Grad-CAM inference — NOT cached (requires live gradients)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+    try:
+        return predict(tmp_path, return_heatmap=True)
+    finally:
+        _safe_remove(tmp_path)
+    
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _clamp(value: float) -> float:
+    return max(CONF_CLAMP_MIN, min(value, CONF_CLAMP_MAX))
+
+
+def format_label(label: str) -> str:
+    return label.replace("_", " ").title()
+
+
+def confidence_status(top1: float, top2: float) -> str:
     gap = top1 - top2
+    if gap < GAP_AMBIGUOUS:
+        return "⚠️ Ambiguous"
+    if top1 >= CONF_HIGH:
+        return "✅ High"
+    if top1 >= CONF_MODERATE:
+        return "⚠️ Moderate"
+    return "❌ Low"
 
-    if gap < 0.2:
-        return "⚠️ Uncertain prediction"
-    elif top1 > 0.8:
-        return "✅ High confidence"
-    elif top1 > 0.5:
-        return "⚠️ Moderate confidence"
-    return "❌ Low confidence"
+
+def entropy_label(entropy: float) -> str:
+    if entropy <= ENTROPY_LOW:
+        return "🟢 Low — model is confident"
+    if entropy <= ENTROPY_HIGH:
+        return "🟡 Medium — some uncertainty"
+    return "🔴 High — prediction is unreliable"
 
 
-def get_advice(label: str) -> Optional[str]:
+def get_advice(label: str) -> str | None:
     label_lower = label.lower()
     if "blight" in label_lower:
         return "Use fungicide and avoid overwatering."
@@ -56,195 +122,209 @@ def get_advice(label: str) -> Optional[str]:
     return None
 
 
-def format_label(label: str) -> str:
-    return label.replace("_", " ").title()
-
-
 # ---------------------------------------------------------------------------
-# Cached prediction
+# UI sections
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
-def cached_predict(image_bytes: bytes, model_version: str) -> List[Dict]:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        tmp.write(image_bytes)
-        tmp_path = tmp.name
+def _section_upload() -> tuple[bytes | None, Image.Image | None]:
+    st.header("📤 Upload")
+    uploaded = st.file_uploader(
+        "Choose a crop leaf image",
+        type=["jpg", "jpeg", "png"],
+        help="Clear, close-up images produce the best results.",
+    )
 
+    if uploaded is None:
+        return None, None
+
+    if uploaded.size > MAX_FILE_BYTES:
+        st.error("File exceeds 5 MB. Please upload a smaller image.")
+        return None, None
+
+    image_bytes = uploaded.getvalue()
     try:
-        return predict(tmp_path, return_heatmap=False)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        st.error("Invalid or corrupted image.")
+        return None, None
+    return image_bytes, pil_image
+    
+
+
+def _section_preview(
+    pil_image   : Image.Image,
+    show_gradcam: bool,
+    heatmap     : object | None,
+) -> None:
+    st.header("🖼️ Preview")
+
+    if show_gradcam and heatmap is not None:
+        col_orig, col_cam = st.columns(2)
+        with col_orig:
+            st.image(pil_image, caption="Original", use_container_width=True)
+        with col_cam:
+            overlay = overlay_heatmap_on_image(pil_image, np.clip(heatmap, 0, 1))
+            st.image(overlay, caption="Grad-CAM Overlay", use_container_width=True)
+    elif show_gradcam and heatmap is None:
+        st.image(pil_image, caption="Original", use_container_width=True)
+        st.warning("Grad-CAM heatmap is unavailable for this image.")
+    else:
+        st.image(pil_image, caption="Original", use_container_width=True)
+
+
+def _section_analysis(
+    predictions : list[dict],
+    entropy     : float,
+) -> None:
+    st.header("🔬 Analysis")
+
+    top1_conf = predictions[0]["confidence"]
+    top2_conf = predictions[1]["confidence"] if len(predictions) > 1 else 0.0
+    gap       = top1_conf - top2_conf
+    top_label = format_label(predictions[0]["label"])
+
+    # Diagnosis
+    if gap < GAP_AMBIGUOUS and len(predictions) > 1:
+        diagnosis = (
+            f"Possible **{top_label}** or "
+            f"**{format_label(predictions[1]['label'])}**"
+        )
+    else:
+        diagnosis = f"**{top_label}**"
+
+    st.success(f"Diagnosis: {diagnosis} ({_clamp(top1_conf) * 100:.2f}%)")
+
+    # Secondary disease risk
+    if len(predictions) > 1:
+        second = predictions[1]
+        if any(d in second["label"].lower() for d in ("blight", "rust", "spot")):
+            st.warning(
+                f"⚠️ Secondary risk: {format_label(second['label'])} "
+                f"({_clamp(second['confidence']) * 100:.2f}%)"
+            )
+
+    # Confidence banner
+    if top1_conf < CONF_MODERATE:
+        st.error("❌ Very low confidence — result is unreliable.")
+    elif gap < GAP_AMBIGUOUS:
+        st.warning("⚠️ Ambiguous — two classes have similar probabilities.")
+    elif top1_conf < CONF_HIGH:
+        st.info("ℹ️ Moderate confidence — consider manual verification.")
+    else:
+        st.success("✅ High confidence prediction.")
+
+    # Entropy
+    col_e1, col_e2 = st.columns([1, 3])
+    col_e1.metric("Entropy", f"{entropy:.4f}")
+    col_e2.markdown(f"**Uncertainty:** {entropy_label(entropy)}")
+
+    if entropy > ENTROPY_HIGH:
+        st.error("❌ Model is highly uncertain — result may be unreliable.")
+    elif entropy > ENTROPY_LOW:
+        st.warning("⚠️ Moderate uncertainty — verify result.")
+    else:
+        st.success("✅ Low uncertainty — model is confident in this prediction.")
+
+    # Recommendation
+    advice = get_advice(predictions[0]["label"])
+    if advice:
+        st.info(f"💡 **Recommendation:** {advice}")
+
+
+def _section_predictions(predictions: list[dict]) -> None:
+    st.header("📊 Predictions")
+
+    top1_conf = predictions[0]["confidence"]
+    top2_conf = predictions[1]["confidence"] if len(predictions) > 1 else 0.0
+    
+
+    for rank, pred in enumerate(predictions, start=1):
+        label      = pred["label"]
+        confidence = _clamp(pred["confidence"])
+
+        with st.container(border=True):
+            c_rank, c_label, c_pct, c_status = st.columns([0.5, 3, 1.5, 2.5])
+            c_rank.markdown(f"**#{rank}**")
+            c_label.markdown(f"**{format_label(label)}**")
+            c_pct.markdown(f"`{confidence * 100:.2f}%`")
+            c_status.markdown(
+                confidence_status(top1_conf, top2_conf) if rank == 1 else ""
+            )
+            st.progress(confidence)
 
 
 # ---------------------------------------------------------------------------
-# Grad-CAM prediction
-# ---------------------------------------------------------------------------
-
-def gradcam_predict(image_bytes: bytes) -> Dict:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        tmp.write(image_bytes)
-        tmp_path = tmp.name
-
-    try:
-        return predict(tmp_path, return_heatmap=True)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# UI
+# Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.set_page_config(page_title="AgriVision", page_icon="🌿", layout="centered")
+    st.set_page_config(
+        page_title="AgriVision",
+        page_icon="🌿",
+        layout="centered",
+    )
 
     load_model_once()
 
     st.title("🌿 AgriVision — Crop Disease Detection")
-    st.caption("⚡ First prediction may take ~30–60 seconds")
-    st.caption("Upload a crop image to detect diseases and get recommendations.")
+    st.caption("Upload a crop leaf image to identify diseases and receive care advice.")
+    st.caption("💡 Tip: Use a single leaf with minimal background for best results.")
+    st.divider()
 
-    uploaded_file = st.file_uploader(
-        "Upload a crop leaf image",
-        type=["jpg", "jpeg", "png"],
-    )
+    # ── Upload ────────────────────────────────────────────────────────
+    image_bytes, pil_image = _section_upload()
 
-    if uploaded_file and uploaded_file.size > 5 * 1024 * 1024:
-        st.error("File too large (>5MB).")
+    if image_bytes is None or pil_image is None:
         return
-
-    if not uploaded_file:
-        return
-
-    st.info("📸 Tip: Use a clear, close-up image of a single leaf.")
-
-    image_bytes = uploaded_file.getvalue()
-    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    show_gradcam = st.toggle("🔬 Enable Explainability (Grad-CAM)", value=False)
-
-    if not show_gradcam:
-        st.image(pil_image, caption="Original", width=400)
-
-    # ------------------------------------------------------------------
-    # Prediction
-    # ------------------------------------------------------------------
-
-    with st.spinner("Analyzing image..."):
-        try:
-            if show_gradcam:
-                result = gradcam_predict(image_bytes)
-                predictions = result.get("predictions", [])
-                heatmap = result.get("heatmap", None)
-            else:
-                predictions = cached_predict(image_bytes, MODEL_VERSION)
-                heatmap = None
-
-            if not predictions:
-                st.error("No predictions returned.")
-                return
-
-        except Exception as e:
-            import traceback
-            st.error(f"Inference failed: {str(e)}")
-            st.text(traceback.format_exc())
-            return
-
-    # ------------------------------------------------------------------
-    # Heatmap
-    # ------------------------------------------------------------------
-
-    if show_gradcam:
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.image(pil_image, caption="Original", width=400)
-
-        with col2:
-            if heatmap is not None:
-                heatmap = np.clip(heatmap, 0, 1)
-                overlay = overlay_heatmap_on_image(pil_image, heatmap)
-                st.image(overlay, caption="Grad-CAM Overlay", width=400)
-            else:
-                st.warning("Heatmap unavailable.")
-                st.image(pil_image, width=400)
-
-    # ------------------------------------------------------------------
-    # Results
-    # ------------------------------------------------------------------
-
-    st.subheader("Top Predictions")
-
-    predictions = sorted(predictions, key=lambda x: x["confidence"], reverse=True)
-
-    top = predictions[0]
-    conf = top["confidence"]
-
-    top1 = predictions[0]["confidence"]
-    top2 = predictions[1]["confidence"] if len(predictions) > 1 else 0.0
-    gap = top1 - top2
-
-    conf_display = max(min(conf, 0.999), 0.001)
-
-    # ✅ Better diagnosis output
-    if gap < 0.2:
-        final_label = f"Possible {format_label(predictions[0]['label'])} or {format_label(predictions[1]['label'])}"
-    else:
-        final_label = format_label(predictions[0]['label'])
-
-    st.success(f"Diagnosis: **{final_label}** ({conf_display * 100:.2f}%)")
-
-    # ✅ Secondary risk alert
-    if len(predictions) > 1:
-        second = predictions[1]
-        if "blight" in second["label"].lower():
-            st.warning(
-                f"⚠️ Secondary risk detected: {format_label(second['label'])} "
-                f"({second['confidence']*100:.2f}%)"
-            )
-
-    # ✅ Confidence logic
-    if conf < 0.4:
-        st.error("❌ Very low confidence — unreliable prediction.")
-    elif gap < 0.2:
-        st.warning("⚠️ Ambiguous prediction — similar probabilities detected.")
-    elif conf < 0.7:
-        st.info("ℹ️ Moderate confidence — verify result.")
-    else:
-        st.success("✅ High confidence in prediction.")
-
-    # ------------------------------------------------------------------
-    # Prediction list
-    # ------------------------------------------------------------------
-
-    for rank, pred in enumerate(predictions, start=1):
-        label = pred["label"]
-        confidence = pred["confidence"]
-        confidence_display = max(min(confidence, 0.999), 0.001)
-
-        status = get_confidence_status(top1, top2)
-
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([0.5, 3, 1.5, 2.5])
-            c1.markdown(f"**#{rank}**")
-            c2.markdown(f"**{format_label(label)}**")
-            c3.markdown(f"`{confidence_display*100:.2f}%`")
-            c4.markdown(status)
-            st.progress(confidence_display)
-
-        if rank == 1:
-            advice = get_advice(label)
-            if advice:
-                st.info(f"💡 Recommendation: {advice}")
 
     st.divider()
-    st.caption("Model: Custom CNN • Input: 224×224 • Classes: 9")
+
+    # ── Grad-CAM toggle ───────────────────────────────────────────────
+    show_gradcam = st.toggle("🔬 Enable Explainability (Grad-CAM)", value=False)
+
+    # ── Inference ─────────────────────────────────────────────────────
+    with st.spinner("Analysing image…"):
+        try:
+            if show_gradcam:
+                result      = gradcam_predict(image_bytes)
+                predictions = result.get("predictions", [])
+                entropy     = result.get("entropy", 0.0)
+                heatmap     = result.get("heatmap", None)
+            else:
+                result      = cached_predict(image_bytes, MODEL_VERSION)
+                predictions = result.get("predictions", [])
+                entropy     = result.get("entropy", 0.0)
+                heatmap     = None
+
+        except Exception as exc:
+            logging.exception(exc)
+            st.error(f"Inference failed: {exc}")
+            return
+
+    if not predictions:
+        st.error("No predictions returned. Please try a different image.")
+        return
+
+    predictions = sorted(predictions, key=lambda p: p["confidence"], reverse=True)
+
+    st.divider()
+
+    # ── Preview ───────────────────────────────────────────────────────
+    _section_preview(pil_image, show_gradcam, heatmap)
+    st.divider()
+
+    # ── Analysis ──────────────────────────────────────────────────────
+    _section_analysis(predictions, entropy)
+    st.divider()
+
+    # ── Predictions ───────────────────────────────────────────────────
+    _section_predictions(predictions)
+    st.divider()
+
+    st.caption(
+        "Model: PlantDiseaseResNet (ResNet50) · "
+        "Input: 224×224 · Classes: 9 · Output: Top-3 predictions"
+    )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ class Prediction(BaseModel):
 
 class PredictionResponse(BaseModel):
     predictions: List[Prediction]
+    entropy: float
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ def root() -> dict:
 # Prediction endpoint
 # ---------------------------------------------------------------------------
 
-@app.post("/predict", response_model=PredictionResponse, include_in_schema=False)
+@app.post("/predict", response_model=PredictionResponse)
 def predict_endpoint(file: UploadFile = File(...)):
 
     # Validate file type
@@ -48,22 +49,26 @@ def predict_endpoint(file: UploadFile = File(...)):
         )
 
     # Validate file size (max 5MB)
-    if file.size and file.size > 5 * 1024 * 1024:
+    contents = file.file.read()
+    if len(contents) > 5 * 1024 * 1024:
         raise HTTPException(
             status_code=400,
             detail="File too large (max 5MB)"
         )
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name 
 
-    tmp_path: str | None = None
+    
 
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            file.file.seek(0)
-            tmp.write(file.file.read())
-            tmp_path = tmp.name
-
-        predictions = predict(tmp_path)
-        return {"predictions": predictions}
+        
+        result = predict(tmp_path)
+        return{
+            "predictions": result.get("predictions", []),
+            "entropy": result.get("entropy", 0.0),
+        }
 
     except HTTPException:
         raise
