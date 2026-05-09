@@ -1,8 +1,3 @@
-"""
-utils/config.py — Single source of truth for the plant disease classification system.
-Covers training, inference, preprocessing, GradCAM, FastAPI backend, and Streamlit frontend.
-"""
-
 import torch
 from pathlib import Path
 import os
@@ -12,7 +7,6 @@ from typing import Tuple, Dict, Set
 # 1. ROOT & DATA PATHS
 # ─────────────────────────────────────────────
 
-# Resolves to the project root regardless of where the script is invoked from.
 BASE_DIR: Path = Path(__file__).resolve().parent.parent
 
 DATA_DIR:       Path = BASE_DIR / "data" / "raw"
@@ -26,7 +20,7 @@ GRADCAM_OUTPUT_DIR: Path = OUTPUTS_DIR / "gradcam"
 # 2. REPRODUCIBILITY
 # ─────────────────────────────────────────────
 
-SEED: int = 42  # Used by train.py, preprocess.py, and any data-split logic.
+SEED: int = 42 
 torch.manual_seed(SEED)
 
 if torch.cuda.is_available():
@@ -38,10 +32,9 @@ if torch.cuda.is_available():
 # 3. DEVICE
 # ─────────────────────────────────────────────
 
-# Auto-detects the best available device.
 DEVICE: str = (
     "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()   # Apple Silicon
+    else "mps" if torch.backends.mps.is_available()  
     else "cpu"
 )
 
@@ -50,7 +43,7 @@ DEVICE: str = (
 # ─────────────────────────────────────────────
 
 IMAGE_SIZE:    int   = 224 
-RESIZE_SIZE: int = 256         # EfficientNet-B0 canonical input size.
+RESIZE_SIZE: int = 256         
 BATCH_SIZE:    int   = 32
 LEARNING_RATE: float = 1e-4
 EPOCHS:        int   = 25

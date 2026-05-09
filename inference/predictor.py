@@ -1,249 +1,273 @@
 """
-inference/predictor.py — Single-image inference for PlantDiseaseResNet
+inference/predictor.py — Production inference engine for PlantDiseaseEfficientNet.
+
 """
 
-import os
-import sys
 import logging
+import threading
+from pathlib import Path
+from typing import TypedDict, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision import transforms
 from PIL import Image
-from typing import Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from models.cnn_baseline import PlantDiseaseResNet
 from utils.gradcam import GradCAM
+from inference.preprocess import ImageInput, preprocess_image
+from models.efficientnet_model import PlantDiseaseEfficientNet, build_model
+from utils.config import (
+    CLASS_NAMES,
+    DEVICE,
+    IDX_TO_CLASS,
+    MODEL_PATH,
+    NUM_CLASSES,
+)
 
-logging.basicConfig(level=logging.WARNING)
-
-# ---------------------------------------------------------------------------
-# Model download config
-# ---------------------------------------------------------------------------
-
-MODEL_PATH = "models/best_model.pth"
-MODEL_URL  = "https://drive.google.com/uc?id=1JKlHmyCNOrVSIlfyHtSADj2u2BnotDFv"
-
-
-def _ensure_model_downloaded() -> None:
-    if not os.path.exists(MODEL_PATH):
-        os.makedirs("models", exist_ok=True)
-        print("Downloading model weights…")
-        try:
-            import gdown
-            gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
-        except Exception as exc:
-            raise RuntimeError("Model download failed.") from exc
-
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found at '{MODEL_PATH}'.")
+log = logging.getLogger(__name__)  
 
 
-_ensure_model_downloaded()
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CONFIG = {
-    "checkpoint_path" : MODEL_PATH,
-    "num_classes"     : 9,
-    "top_k"           : 3,
-    "image_size"      : 224,
-    "mean"            : [0.485, 0.456, 0.406],
-    "std"             : [0.229, 0.224, 0.225],
-}
-
-# Fixed class names — no dataset dependency
-CLASS_NAMES: list[str] = [
-    "Corn Cercospora Leaf Spot",
-    "Corn Common Rust",
-    "Corn Healthy",
-    "Potato Early Blight",
-    "Potato Healthy",
-    "Potato Late Blight",
-    "Tomato Early Blight",
-    "Tomato Healthy",
-    "Tomato Late Blight",
-]
-
-# ---------------------------------------------------------------------------
-# Deterministic inference transforms — NO random ops
-# ---------------------------------------------------------------------------
-
-INFERENCE_TRANSFORMS = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(CONFIG["image_size"]),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=CONFIG["mean"], std=CONFIG["std"]),
-])
-
-# ---------------------------------------------------------------------------
-# Global model cache
-# ---------------------------------------------------------------------------
-
-_MODEL       : Optional[PlantDiseaseResNet] = None
-_DEVICE      : Optional[torch.device]       = None
+class ClassPrediction(TypedDict):
+    rank:        int
+    label:       str
+    class_index: int
+    confidence:  float   # softmax probability, rounded to 4 d.p.
 
 
-def load_model(cfg: dict = CONFIG) -> tuple[PlantDiseaseResNet, torch.device]:
-    global _MODEL, _DEVICE
+class PredictionResult(TypedDict):
+    top_prediction: ClassPrediction          
+    top_k:          List[ClassPrediction]     
+    entropy:        float                     
+    heatmap:        Optional[np.ndarray]        
+
+_CACHE_LOCK: threading.Lock                      = threading.Lock()
+_MODEL:      Optional[PlantDiseaseEfficientNet] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Checkpoint loading & validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_from_checkpoint(path: Path) -> PlantDiseaseEfficientNet:
+   
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: '{path}'.\n"
+            "Run train.py first, or point MODEL_PATH in config.py to the correct file."
+        )
+
+    log.info("Loading checkpoint: %s", path)
+    ckpt: dict = torch.load(path, map_location=DEVICE, weights_only=False)
+
+    required = {"model_state_dict", "class_names", "num_classes"}
+    missing  = required - set(ckpt.keys())
+    if missing:
+        raise KeyError(
+            f"Checkpoint is missing required keys: {missing}.\n"
+            "This checkpoint was not saved by the corrected train.py.\n"
+            f"Found keys: {set(ckpt.keys())}"
+        )
+
+    ckpt_classes: List[str] = ckpt["class_names"]
+    if ckpt_classes != CLASS_NAMES:
+        diff = [
+            f"  [{i}] ckpt='{c}'  config='{k}'"
+            for i, (c, k) in enumerate(zip(ckpt_classes, CLASS_NAMES))
+            if c != k
+        ]
+        raise RuntimeError(
+            "Checkpoint class_names ≠ config.CLASS_NAMES.\n"
+            "Every prediction would map to the wrong label.\n"
+            "Mismatched positions:\n" + "\n".join(diff)
+        )
+
+    if ckpt["num_classes"] != NUM_CLASSES:
+        raise RuntimeError(
+            f"Checkpoint num_classes={ckpt['num_classes']} ≠ "
+            f"config.NUM_CLASSES={NUM_CLASSES}.\n"
+            "The final Linear layer shape would mismatch. Retrain with current config."
+        )
+
+ 
+    model  = build_model(freeze_backbone=False, device=DEVICE)
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError(
+            f"state_dict shape mismatch:\n"
+            f"  Missing keys    : {result.missing_keys}\n"
+            f"  Unexpected keys : {result.unexpected_keys}\n"
+            "Do not change strict=False to suppress this — fix the source mismatch."
+        )
+
+    model.eval()
+    log.info(
+        "Checkpoint loaded | epoch=%s | val_f1=%s | val_acc=%s",
+        ckpt.get("epoch",        "?"),
+        f"{ckpt.get('val_f1',        float('nan')):.4f}",
+        f"{ckpt.get('val_accuracy',  float('nan')):.2%}",
+    )
+    return model
+
+
+def load_model(path: Path = MODEL_PATH) -> PlantDiseaseEfficientNet:
+    
+    global _MODEL
 
     if _MODEL is not None:
-        return _MODEL, _DEVICE
+        return _MODEL
 
-    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(cfg["checkpoint_path"], map_location=device)
+    with _CACHE_LOCK:
+        if _MODEL is not None:         
+            return _MODEL
+        _MODEL = _load_from_checkpoint(path)
 
-    model = PlantDiseaseResNet(num_classes=cfg["num_classes"])
-
-    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
-
-    model.to(device)
-    model.eval()
-
-    dummy = torch.zeros(1, 3, 224, 224).to(device)
-    with torch.no_grad():
-        model(dummy)
-
-    _MODEL  = model
-    _DEVICE = device
-    return _MODEL, _DEVICE
+    return _MODEL
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Inference utilities
+# ─────────────────────────────────────────────────────────────────────────────
 
-def preprocess_image(image_path: str) -> torch.Tensor:
-    try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as exc:
-        raise ValueError(f"Invalid or corrupted image : '{image_path}'") from exc
+def _build_top_k(probs_1d: torch.Tensor, top_k: int) -> List[ClassPrediction]:
+    
+    k       = min(top_k, NUM_CLASSES)
 
-    return INFERENCE_TRANSFORMS(image).unsqueeze(0)   # (1, 3, 224, 224)
+    if k <= 0:
+        raise ValueError("top_k must be greater than 0.")
 
+    vals, idxs = torch.topk(probs_1d, k=k)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _top_k_predictions(
-    probs       : torch.Tensor,
-    class_names : list[str],
-    top_k       : int,
-) -> list[dict]:
-    top_probs, top_indices = torch.topk(probs, k=top_k, dim=1)
     return [
-        {
-            "label"      : class_names[idx.item()],
-            "confidence" : round(prob.item(), 4),
-        }
-        for prob, idx in zip(top_probs[0], top_indices[0])
+        ClassPrediction(
+            rank        = rank + 1,
+            label       = IDX_TO_CLASS[idx.item()],
+            class_index = idx.item(),
+            confidence  = round(val.item(), 4),
+        )
+        for rank, (val, idx) in enumerate(zip(vals, idxs))
     ]
 
 
-def _compute_entropy(probs: torch.Tensor) -> float:
-    """Shannon entropy (nats) over the full probability distribution."""
-    p = probs.squeeze(0).clamp(min=1e-9)
-    return round(float(-torch.sum(p * torch.log(p)).item()), 6)
+def _compute_entropy(probs_1d: torch.Tensor) -> float:
+   
+    p = probs_1d.clamp(min=1e-9)
+    return round(float(-(p * p.log()).sum().item()), 6)
 
 
-# ---------------------------------------------------------------------------
-# Main predict function
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Main predict entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def predict(
-    image_path    : str,
-    cfg           : dict = CONFIG,
-    return_heatmap: bool = False,
-) -> dict:
-    """
-    Run inference on a single image.
+    source:        ImageInput,
+    *,
+    top_k:         int  = 3,
+    return_gradcam: bool = False,
+    ckpt_path:     Path = MODEL_PATH,
+) -> PredictionResult:
+    
+    model = load_model(ckpt_path)
 
-    Args:
-        image_path     : Path to the input image.
-        cfg            : Configuration dict.
-        return_heatmap : When True, run Grad-CAM and include heatmap in output.
+    tensor: torch.Tensor
+    pil_image: Image.Image
+    tensor, pil_image = preprocess_image(source, return_pil=True)   # type: ignore[misc]
+    tensor = tensor.to(DEVICE)
+    if torch.isnan(tensor).any():
+        raise RuntimeError("Input tensor contains NaN values.")
 
-    Returns:
-        {
-            "predictions" : [{"label": str, "confidence": float}, ...],
-            "entropy"     : float,              # uncertainty measure
-            "heatmap"     : object | None,  # only when return_heatmap=True
-        }
-    """
-    model, device = load_model(cfg)
-    tensor        = preprocess_image(image_path).to(device)
-
-    # ── Standard inference path ────────────────────────────────────────
-    if not return_heatmap:
+    if not return_gradcam:
         with torch.inference_mode():
-            probs = F.softmax(model(tensor), dim=1)
+            logits:  torch.Tensor = model(tensor)    
+            if torch.isnan(logits).any():
+                raise RuntimeError("NaN logits detected.")
 
-        return {
-            "predictions" : _top_k_predictions(probs, CLASS_NAMES, cfg["top_k"]),
-            "entropy"     : _compute_entropy(probs),
-            "heatmap"     : None,
-        }
+            probs:   torch.Tensor = F.softmax(logits, dim=1)[0]     
 
-    # ── Grad-CAM path — gradients required ────────────────────────────
-    heatmap : Optional[object] = None
-    probs   : Optional[torch.Tensor] = None
+        top_k_preds = _build_top_k(probs, top_k)
+        return PredictionResult(
+            top_prediction = top_k_preds[0],
+            top_k          = top_k_preds,
+            entropy        = _compute_entropy(probs),
+            heatmap        = None,
+        )
 
-    # Target layer: last ResNet block via helper method (last ResNet block before avgpool)
-    gradcam = GradCAM(model, target_layer=model.get_gradcam_target_layer())
+   
+    heatmap: Optional[np.ndarray] = None
+
+    target_layer = model.get_gradcam_target_layer()
+    gradcam      = GradCAM(model=model, target_layer=target_layer)
 
     try:
         with torch.enable_grad():
-            logits = model(tensor)
-            probs = F.softmax(logits, dim=1)
+            logits = model(tensor)     
+            if torch.isnan(logits).any():
+                raise RuntimeError("NaN logits detected.")
 
+            probs  = F.softmax(logits, dim=1)[0]                   
 
-            top_idx = int(probs.argmax(dim=1).item())
-            heatmap = gradcam.generate(tensor, class_idx=top_idx)
+        top_idx: int = int(logits.argmax(dim=1).item())
+        heatmap = gradcam.generate(
+            tensor    = tensor,
+            pil_image = pil_image,
+            class_idx = top_idx,
+        )
 
     except Exception as exc:
-        logging.warning(f"[GradCAM] Heatmap generation failed — {exc}")
+        log.warning("GradCAM generation failed: %s — returning prediction without heatmap.", exc)
         heatmap = None
 
-        if probs is None:
-            with torch.inference_mode():
-                probs = F.softmax(model(tensor), dim=1)
+        with torch.inference_mode():
+            logits = model(tensor)
+
+            if torch.isnan(logits).any():
+                raise RuntimeError("NaN logits detected.")
+            
+            probs = F.softmax(logits, dim=1)[0]
 
     finally:
         gradcam.remove_hooks()
 
-    return {
-        "predictions" : _top_k_predictions(probs, CLASS_NAMES, cfg["top_k"]),
-        "entropy"     : _compute_entropy(probs),
-        "heatmap"     : heatmap,
-    }
+    top_k_preds = _build_top_k(probs, top_k)
+    return PredictionResult(
+        top_prediction = top_k_preds[0],
+        top_k          = top_k_preds,
+        entropy        = _compute_entropy(probs),
+        heatmap        = heatmap,
+    )
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cli() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Plant disease single-image inference.")
+    parser.add_argument("image",     type=Path, help="Path to input image.")
+    parser.add_argument("--top-k",   type=int,  default=3)
+    parser.add_argument("--heatmap", action="store_true", help="Generate GradCAM overlay.")
+    parser.add_argument("--ckpt",    type=Path, default=MODEL_PATH)
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
+    result = predict(args.image, top_k=args.top_k, return_gradcam=args.heatmap, ckpt_path=args.ckpt)
+
+    print(f"\n{'─'*45}")
+    print(f"  Top-{args.top_k} Predictions")
+    print(f"{'─'*45}")
+    for p in result["top_k"]:
+        bar = "█" * int(p["confidence"] * 30)
+        print(f"  {p['rank']}. {p['label']:<32} {p['confidence']*100:>6.2f}%  {bar}")
+    print(f"\n  Entropy : {result['entropy']:.6f}  ({'uncertain' if result['entropy'] > 1.5 else 'confident'})")
+
+    hm = result["heatmap"]
+    if args.heatmap:
+        print(f"  Heatmap : "
+              f"{'shape=' + str(hm.shape) + f'  min={hm.min()}'+ f'  max={hm.max()}' if hm is not None else 'unavailable'}")
+    print()
+
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (2, 3):
-        print("Usage: python inference/predictor.py <image_path> [--heatmap]")
-        sys.exit(1)
-
-    _path         = sys.argv[1]
-    _want_heatmap = len(sys.argv) == 3 and sys.argv[2] == "--heatmap"
-    _result       = predict(_path, return_heatmap=_want_heatmap)
-
-    print("\nTop-3 Predictions")
-    print("-" * 35)
-    for i, r in enumerate(_result["predictions"], 1):
-        print(f"  {i}. {r['label']:<30} {r['confidence'] * 100:>6.2f}%")
-    print(f"\nEntropy : {_result['entropy']}")
-
-    if _want_heatmap:
-        hm = _result["heatmap"]
-        print(f"Heatmap : {f'shape={hm.shape}  min={hm.min():.4f}  max={hm.max():.4f}' if hm is not None else 'unavailable'}")
-    print()
+    _cli()
